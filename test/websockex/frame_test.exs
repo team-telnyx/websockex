@@ -334,6 +334,25 @@ defmodule WebSockex.FrameTest do
   end
 
   describe "encode_frame" do
+    test "masks binary payloads of every length modulo 4, including large ones" do
+      for len <- Enum.to_list(0..9) ++ [125, 126, 65_535, 65_536, 300_000] do
+        payload = :crypto.strong_rand_bytes(len)
+
+        assert {:ok, <<1::1, 0::3, 2::4, 1::1, rest::bitstring>>} =
+                 Frame.encode_frame({:binary, payload})
+
+        {mask, masked} =
+          case rest do
+            <<l::7, mask::bytes-size(4), masked::binary>> when l < 126 -> {mask, masked}
+            <<126::7, _::16, mask::bytes-size(4), masked::binary>> -> {mask, masked}
+            <<127::7, _::64, mask::bytes-size(4), masked::binary>> -> {mask, masked}
+          end
+
+        assert byte_size(masked) == len
+        assert unmask(mask, masked) == payload
+      end
+    end
+
     test "encodes a ping frame" do
       assert {:ok, <<1::1, 0::3, 9::4, 1::1, 0::7, _::32>>} = Frame.encode_frame(:ping)
     end

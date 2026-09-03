@@ -384,18 +384,14 @@ defmodule WebSockex.Frame do
     end
   end
 
-  defp mask(key, payload, acc \\ <<>>)
-  defp mask(_, <<>>, acc), do: acc
+  # XOR-masking 1-4 bytes at a time in Elixir costs ~150µs per 4 KiB frame.
+  # Clients streaming audio (hundreds of connections, ~15 frames/s each) spend
+  # a large share of a core here. :crypto.exor/2 does it natively in a few µs.
+  defp mask(_key, <<>>), do: <<>>
 
-  for x <- 1..3 do
-    defp mask(<<key::8*unquote(x), _::binary>>, <<part::8*unquote(x)>>, acc) do
-      masked = Bitwise.bxor(part, key)
-      <<acc::binary, masked::8*unquote(x)>>
-    end
-  end
-
-  defp mask(<<key::32>> = key_bin, <<part::8*4, rest::binary>>, acc) do
-    masked = Bitwise.bxor(part, key)
-    mask(key_bin, rest, <<acc::binary, masked::8*4>>)
+  defp mask(<<key::binary-size(4)>>, payload) do
+    size = byte_size(payload)
+    key_stream = binary_part(:binary.copy(key, div(size + 3, 4)), 0, size)
+    :crypto.exor(payload, key_stream)
   end
 end
