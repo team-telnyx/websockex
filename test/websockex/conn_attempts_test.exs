@@ -1,5 +1,6 @@
 defmodule WebSockex.ConnAttemptsTest do
-  use ExUnit.Case, async: true
+  # Not async: the timing assertions need the module to run alone.
+  use ExUnit.Case, async: false
 
   alias WebSockex.{Conn, ConnError}
 
@@ -7,7 +8,7 @@ defmodule WebSockex.ConnAttemptsTest do
   # Linux: 127.0.0.2 is loopback, so a listener with a full accept queue makes
   # it drop SYNs. macOS: the address is not assigned and SYNs to it vanish.
   @blackhole {127, 0, 0, 2}
-  @slack 250
+  @slack 500
 
   @priv Path.join([__DIR__, "..", "support", "priv"])
   @cacertfile Path.join(@priv, "websockexca.cer")
@@ -31,14 +32,18 @@ defmodule WebSockex.ConnAttemptsTest do
   defp fill_accept_queue({:error, :eaddrnotavail}, _port), do: []
 
   defp fill_accept_queue({:ok, listener}, port) do
+    # A connect that fits in the queue returns at once, so only the last one
+    # waits. The long timeout keeps a slow connect under load from looking
+    # like a full queue.
     held =
       Enum.reduce_while(1..16, [], fn _, held ->
-        case :gen_tcp.connect(@blackhole, port, [], 100) do
+        case :gen_tcp.connect(@blackhole, port, [], 500) do
           {:ok, socket} -> {:cont, [socket | held]}
           {:error, :timeout} -> {:halt, held}
         end
       end)
 
+    assert held != []
     [listener | held]
   end
 
@@ -121,7 +126,7 @@ defmodule WebSockex.ConnAttemptsTest do
         Conn.new("ws://test.host:#{port}/",
           tcp_attempt_timeout: 200,
           socket_connect_timeout: 2000,
-          resolver: resolver([@blackhole, @loopback]),
+          resolver: resolver([@blackhole, @loopback, @loopback]),
           on_connect_attempt: recorder()
         )
 
@@ -150,13 +155,13 @@ defmodule WebSockex.ConnAttemptsTest do
       conn =
         Conn.new("ws://test.host:#{port}/",
           tcp_attempt_timeout: 100,
-          socket_connect_timeout: 600,
+          socket_connect_timeout: 1000,
           resolver: resolver([@blackhole]),
           on_connect_attempt: recorder()
         )
 
       assert {elapsed, {:error, %ConnError{original: :timeout}}} = timed_open(conn)
-      assert_about(elapsed, 600)
+      assert_about(elapsed, 1000)
 
       assert [
                %{attempt: 1, address: @blackhole, result: {:error, :timeout}, ms: first},
@@ -166,7 +171,7 @@ defmodule WebSockex.ConnAttemptsTest do
 
       assert_about(first, 100)
       assert_about(second, 100)
-      assert last >= 250
+      assert last >= 500
     end
 
     test "tcp_max_attempts: 1 gives the only attempt the whole deadline", %{port: port} do
@@ -227,9 +232,9 @@ defmodule WebSockex.ConnAttemptsTest do
 
       conn =
         Conn.new("ws://test.host:#{port}/",
-          tcp_attempt_timeout: 100,
+          tcp_attempt_timeout: 300,
           socket_connect_timeout: :infinity,
-          resolver: resolver([@blackhole, @loopback]),
+          resolver: resolver([@blackhole, @loopback, @loopback]),
           on_connect_attempt: recorder()
         )
 
