@@ -5,10 +5,49 @@ defmodule WebSockex.Conn do
   Dispatches to the correct module for the underlying connection. (`:gen_tcp` or `:ssl`)
 
   Is woefully inadequite for verifying proper peers in SSL connections.
+
+  ## Fresh-socket TCP attempts
+
+  By default a connection is one `:gen_tcp.connect/4` or `:ssl.connect/4` call
+  with `:socket_connect_timeout` as its timeout. When a TCP SYN is lost, the
+  kernel retransmits it on the same socket, and that flow often stays lossy.
+
+  Setting `:tcp_attempt_timeout` switches to a different connect path:
+
+  1. `:socket_connect_timeout` becomes one deadline for DNS resolution, all TCP
+     attempts and the TLS handshake together.
+  2. The host is resolved once (IPv4, `:inet.getaddrs/2`). IP literals skip
+     resolution.
+  3. Up to `:tcp_max_attempts` TCP connects are made, each on a new socket (new
+     source port), rotating through the resolved addresses. Each attempt waits
+     `min(tcp_attempt_timeout, time left)`; the last attempt waits for all the
+     time that is left. Only `:timeout`, `:econnrefused`, `:econnreset`,
+     `:closed`, `:ehostunreach` and `:enetunreach` lead to another attempt.
+  4. For `wss://`, the TLS handshake runs once on the connected socket with the
+     time that is left. It is never retried. The host name is sent as SNI and
+     used for hostname verification, as in the default path, unless
+     `:ssl_options` already contains `:server_name_indication`.
+
+  In this path `:socket_options` apply to the TCP socket for `wss://` too.
+  TCP-level options inside `:ssl_options` (for example `:nodelay`) are not
+  applied to the socket; put them in `:socket_options`.
+
+  When the deadline is used up before the TLS handshake can start, the
+  `:on_connect_attempt` function still gets a `:tls` event with
+  `result: {:error, :timeout}`.
   """
 
   @socket_connect_timeout_default 6000
   @socket_recv_timeout_default 5000
+  @tcp_max_attempts_default 3
+  @retryable_tcp_errors [
+    :timeout,
+    :econnrefused,
+    :econnreset,
+    :closed,
+    :ehostunreach,
+    :enetunreach
+  ]
 
   defstruct conn_mod: nil,
             host: nil,
@@ -24,7 +63,11 @@ defmodule WebSockex.Conn do
             insecure: true,
             resp_headers: [],
             ssl_options: nil,
-            socket_options: nil
+            socket_options: nil,
+            tcp_attempt_timeout: nil,
+            tcp_max_attempts: @tcp_max_attempts_default,
+            on_connect_attempt: nil,
+            resolver: nil
 
   @type socket :: :gen_tcp.socket() | :ssl.sslsocket()
   @type header :: {field :: String.t(), value :: String.t()}
@@ -49,6 +92,17 @@ defmodule WebSockex.Conn do
     from socket, default #{@socket_recv_timeout_default} ms.
   - `:ssl_options` - extra options for an SSL connection
   - `:socket_options` - extra options for the TCP part of the connection
+  - `:tcp_attempt_timeout` - Timeout in ms for one TCP connect attempt. Setting
+    it enables fresh-socket TCP attempts and makes `:socket_connect_timeout`
+    the deadline for DNS + TCP + TLS together, see the module documentation.
+    _Defaults to `nil`_, which keeps the single-call connect.
+  - `:tcp_max_attempts` - Maximum number of TCP connect attempts when
+    `:tcp_attempt_timeout` is set, default #{@tcp_max_attempts_default}.
+  - `:on_connect_attempt` - A 1-arity function called after each TCP attempt
+    and after the TLS handshake when `:tcp_attempt_timeout` is set. It receives
+    a `t:connect_attempt/0` map. It runs in the connecting process; anything it
+    raises, throws or exits with is ignored. The time it takes counts against
+    `:socket_connect_timeout`, so keep it fast.
 
   [public_key]: http://erlang.org/doc/apps/public_key/using_public_key.html
   """
@@ -60,6 +114,27 @@ defmodule WebSockex.Conn do
           | {:socket_recv_timeout, non_neg_integer}
           | {:ssl_options, [:ssl.tls_client_option()]}
           | {:socket_options, [:gen_tcp.option()]}
+          | {:tcp_attempt_timeout, pos_integer | nil}
+          | {:tcp_max_attempts, pos_integer}
+          | {:on_connect_attempt, (connect_attempt -> any) | nil}
+
+  @typedoc """
+  The event passed to the `:on_connect_attempt` function.
+
+  - `:phase` - `:tcp` for a TCP connect attempt, `:tls` for the TLS handshake.
+  - `:attempt` - The TCP attempt number, starting at 1. For `:tls` it is the
+    attempt that produced the socket.
+  - `:address` - The IP address used.
+  - `:ms` - Duration of the attempt or handshake in ms.
+  - `:result` - `:ok` or `{:error, reason}`.
+  """
+  @type connect_attempt :: %{
+          phase: :tcp | :tls,
+          attempt: pos_integer,
+          address: :inet.ip_address(),
+          ms: non_neg_integer,
+          result: :ok | {:error, term}
+        }
 
   @type t :: %__MODULE__{
           conn_mod: :gen_tcp | :ssl,
@@ -72,7 +147,10 @@ defmodule WebSockex.Conn do
           socket: socket | nil,
           socket_connect_timeout: non_neg_integer,
           socket_recv_timeout: non_neg_integer,
-          resp_headers: [header]
+          resp_headers: [header],
+          tcp_attempt_timeout: pos_integer | nil,
+          tcp_max_attempts: pos_integer,
+          on_connect_attempt: (connect_attempt -> any) | nil
         }
 
   @doc """
@@ -99,7 +177,12 @@ defmodule WebSockex.Conn do
         Keyword.get(opts, :socket_connect_timeout, @socket_connect_timeout_default),
       socket_recv_timeout: Keyword.get(opts, :socket_recv_timeout, @socket_recv_timeout_default),
       ssl_options: Keyword.get(opts, :ssl_options, nil),
-      socket_options: Keyword.get(opts, :socket_options, nil)
+      socket_options: Keyword.get(opts, :socket_options, nil),
+      tcp_attempt_timeout: Keyword.get(opts, :tcp_attempt_timeout, nil),
+      tcp_max_attempts: Keyword.get(opts, :tcp_max_attempts) || @tcp_max_attempts_default,
+      on_connect_attempt: Keyword.get(opts, :on_connect_attempt, nil),
+      # Test seam: `(charlist -> {:ok, [:inet.ip_address()]} | {:error, term})`.
+      resolver: Keyword.get(opts, :resolver, nil)
     }
   end
 
@@ -172,6 +255,18 @@ defmodule WebSockex.Conn do
   """
   @spec open_socket(__MODULE__.t()) :: {:ok, __MODULE__.t()} | {:error, term}
   def open_socket(conn)
+
+  def open_socket(%{tcp_attempt_timeout: timeout} = conn) when is_integer(timeout) do
+    deadline = deadline(conn.socket_connect_timeout)
+
+    with {:ok, addresses} <- resolve(conn, deadline),
+         {:ok, socket, attempt, address} <- tcp_connect(conn, addresses, 1, deadline),
+         {:ok, socket} <- tls_upgrade(conn, socket, attempt, address, deadline) do
+      {:ok, Map.put(conn, :socket, socket)}
+    else
+      {:error, reason} -> {:error, %WebSockex.ConnError{original: reason}}
+    end
+  end
 
   def open_socket(%{conn_mod: :gen_tcp} = conn) do
     case :gen_tcp.connect(
@@ -311,10 +406,15 @@ defmodule WebSockex.Conn do
         with {:ok, data} <- conn.conn_mod.recv(conn.socket, 0, conn.socket_recv_timeout) do
           wait_for_response(conn, buffer <> data)
         else
-          {:error, reason} -> {:error, %WebSockex.ConnError{original: reason}}
+          {:error, reason} -> {:error, %WebSockex.ConnError{original: upgrade_error(reason)}}
         end
     end
   end
+
+  # The request is already sent here, so a timeout must not look like a
+  # connect timeout.
+  defp upgrade_error(:timeout), do: :upgrade_timeout
+  defp upgrade_error(reason), do: reason
 
   defp format_header({field, value}) do
     "#{field}: #{value}"
@@ -365,6 +465,120 @@ defmodule WebSockex.Conn do
   defp socket_connection_options(%{socket_options: _socket_options}) do
     minimal_socket_connection_options()
   end
+
+  # Fresh-socket TCP attempts, then TLS once. One deadline bounds all of it.
+
+  defp now_ms, do: System.monotonic_time(:millisecond)
+
+  defp deadline(:infinity), do: :infinity
+  defp deadline(timeout), do: now_ms() + timeout
+
+  defp time_left(:infinity), do: :infinity
+  defp time_left(deadline), do: max(deadline - now_ms(), 0)
+
+  defp resolve(conn, deadline) do
+    case parse_host(conn.host) do
+      address when is_tuple(address) -> {:ok, [address]}
+      host -> resolve_host(conn.resolver || (&:inet.getaddrs(&1, :inet)), host, deadline)
+    end
+  end
+
+  # `:inet.getaddrs/2` has no reliable timeout, so the deadline is enforced by
+  # killing the lookup.
+  defp resolve_host(resolver, host, deadline) do
+    task = Task.async(fn -> resolver.(host) end)
+
+    case Task.yield(task, time_left(deadline)) || Task.shutdown(task, :brutal_kill) do
+      {:ok, {:ok, [_ | _] = addresses}} -> {:ok, addresses}
+      {:ok, {:ok, []}} -> {:error, :nxdomain}
+      {:ok, {:error, reason}} -> {:error, reason}
+      nil -> {:error, :timeout}
+    end
+  end
+
+  defp tcp_connect(conn, addresses, attempt, deadline) do
+    case time_left(deadline) do
+      0 -> {:error, :timeout}
+      left -> tcp_attempt(conn, addresses, attempt, deadline, left)
+    end
+  end
+
+  defp tcp_attempt(conn, addresses, attempt, deadline, left) do
+    address = Enum.at(addresses, rem(attempt - 1, length(addresses)))
+    timeout = tcp_timeout(conn, attempt, left)
+    started = now_ms()
+    result = :gen_tcp.connect(address, conn.port, socket_connection_options(conn), timeout)
+    notify(conn, :tcp, attempt, address, started, result)
+    after_tcp_attempt(result, address, conn, addresses, attempt, deadline)
+  end
+
+  # The last attempt gets all the time that is left.
+  defp tcp_timeout(%{tcp_max_attempts: max}, attempt, left) when attempt >= max, do: left
+  defp tcp_timeout(%{tcp_attempt_timeout: timeout}, _attempt, left), do: min(timeout, left)
+
+  defp after_tcp_attempt({:ok, socket}, address, _conn, _addresses, attempt, _deadline),
+    do: {:ok, socket, attempt, address}
+
+  defp after_tcp_attempt(
+         {:error, reason},
+         _address,
+         %{tcp_max_attempts: max} = conn,
+         addresses,
+         attempt,
+         deadline
+       )
+       when reason in @retryable_tcp_errors and attempt < max,
+       do: tcp_connect(conn, addresses, attempt + 1, deadline)
+
+  defp after_tcp_attempt({:error, _} = error, _address, _conn, _addresses, _attempt, _deadline),
+    do: error
+
+  defp tls_upgrade(%{conn_mod: :gen_tcp}, socket, _attempt, _address, _deadline),
+    do: {:ok, socket}
+
+  defp tls_upgrade(conn, socket, attempt, address, deadline) do
+    started = now_ms()
+    result = tls_handshake(socket, upgrade_ssl_options(conn), time_left(deadline))
+    notify(conn, :tls, attempt, address, started, result)
+    close_on_error(result, socket)
+  end
+
+  defp tls_handshake(_socket, _options, 0), do: {:error, :timeout}
+  defp tls_handshake(socket, options, left), do: :ssl.connect(socket, options, left)
+
+  defp close_on_error({:ok, _} = ok, _socket), do: ok
+
+  defp close_on_error({:error, _} = error, socket) do
+    :gen_tcp.close(socket)
+    error
+  end
+
+  # `:ssl.connect/3` on a connected socket does not know the host name. Without
+  # SNI it would verify the certificate against the IP address.
+  defp upgrade_ssl_options(conn) do
+    conn |> ssl_connection_options() |> put_sni(parse_host(conn.host))
+  end
+
+  defp put_sni(options, address) when is_tuple(address), do: options
+  defp put_sni(options, host), do: Keyword.put_new(options, :server_name_indication, host)
+
+  defp notify(%{on_connect_attempt: fun}, phase, attempt, address, started, result)
+       when is_function(fun, 1) do
+    fun.(%{
+      phase: phase,
+      attempt: attempt,
+      address: address,
+      ms: now_ms() - started,
+      result: attempt_result(result)
+    })
+  catch
+    _kind, _reason -> :ok
+  end
+
+  defp notify(_conn, _phase, _attempt, _address, _started, _result), do: :ok
+
+  defp attempt_result({:ok, _socket}), do: :ok
+  defp attempt_result({:error, _} = error), do: error
 
   # Crazy SSL Stuff (It will be normal SSL stuff when I figure out Erlang's ssl)
 
