@@ -124,6 +124,59 @@ defmodule WebSockex.ConnTest do
              WebSockex.Conn.open_socket(context.conn)
   end
 
+  describe "socket_opener" do
+    test "opens the socket instead of the default connect", context do
+      test_pid = self()
+
+      opener = fn conn ->
+        send(test_pid, {:opener_called, conn.host, conn.port})
+        :gen_tcp.connect(~c"localhost", conn.port, [:binary, active: false, packet: 0])
+      end
+
+      conn = WebSockex.Conn.new(context.uri, socket_opener: opener)
+
+      assert {:ok, %WebSockex.Conn{socket: socket} = conn} = WebSockex.Conn.open_socket(conn)
+      assert is_port(socket)
+      host = context.uri.host
+      port = context.uri.port
+      assert_received {:opener_called, ^host, ^port}
+
+      {:ok, request} = WebSockex.Conn.build_request(conn, "pineapple")
+      :ok = WebSockex.Conn.socket_send(conn, request)
+      assert {:ok, _headers} = WebSockex.Conn.handle_response(conn, self())
+    end
+
+    test "takes precedence over tcp_attempt_timeout and resolver", context do
+      test_pid = self()
+
+      opener = fn conn ->
+        send(test_pid, :opener_called)
+        :gen_tcp.connect(~c"localhost", conn.port, [:binary, active: false, packet: 0])
+      end
+
+      conn =
+        WebSockex.Conn.new(context.uri,
+          socket_opener: opener,
+          tcp_attempt_timeout: 100,
+          on_connect_attempt: fn event -> send(test_pid, {:attempt, event}) end,
+          resolver: fn _host -> send(test_pid, :resolver_called) && {:error, :nxdomain} end
+        )
+
+      assert {:ok, %WebSockex.Conn{socket: socket}} = WebSockex.Conn.open_socket(conn)
+      assert is_port(socket)
+      assert_received :opener_called
+      refute_received :resolver_called
+      refute_received {:attempt, _}
+    end
+
+    test "wraps an opener error in a ConnError", context do
+      conn = WebSockex.Conn.new(context.uri, socket_opener: fn _conn -> {:error, :refused} end)
+
+      assert WebSockex.Conn.open_socket(conn) ==
+               {:error, %WebSockex.ConnError{original: :refused}}
+    end
+  end
+
   test "open_socket with bad path", context do
     conn = %{context.conn | path: "bad_path"}
 
