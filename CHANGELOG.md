@@ -1,6 +1,26 @@
 ## In-Tree
 ### Breaking Changes
 - Requires Elixir version 1.7+ due to changes in Stacktrace
+- When the HTTP upgrade response does not arrive within `:socket_recv_timeout`,
+  the error is now `%WebSockex.ConnError{original: :upgrade_timeout}`. It was
+  `original: :timeout`, the same as a connect timeout. Callers that match
+  `original: :timeout` to detect a slow upgrade must match `:upgrade_timeout`.
+  This applies with and without `:tcp_attempt_timeout`.
+
+### Enhancements
+- Added the `:tcp_attempt_timeout`, `:tcp_max_attempts` and
+  `:on_connect_attempt` connection options. See `WebSockex.Conn`.
+  - With `:tcp_attempt_timeout` set, a lost TCP SYN is answered with a new
+    socket instead of waiting for retransmits on the same one. Up to
+    `:tcp_max_attempts` (default 3) TCP attempts rotate through the resolved
+    addresses, then the TLS handshake runs once on the connected socket.
+  - In that mode `:socket_connect_timeout` is one deadline for DNS + TCP + TLS.
+  - `:on_connect_attempt` receives a map for each TCP attempt and for the TLS
+    handshake: `%{phase: :tcp | :tls, attempt:, address:, ms:, result:}`.
+  - The default, `tcp_attempt_timeout: nil`, keeps the previous connect path.
+  - In that mode the host is resolved for IPv4 only, `:socket_options` apply
+    to the TCP socket for `wss://` too, and TCP-level options inside
+    `:ssl_options` (for example `:nodelay`) are not applied to the socket.
 
 ## 0.4.3
 ### Enhancements
