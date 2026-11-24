@@ -67,7 +67,8 @@ defmodule WebSockex.Conn do
             tcp_attempt_timeout: nil,
             tcp_max_attempts: @tcp_max_attempts_default,
             on_connect_attempt: nil,
-            resolver: nil
+            resolver: nil,
+            socket_opener: nil
 
   @type socket :: :gen_tcp.socket() | :ssl.sslsocket()
   @type header :: {field :: String.t(), value :: String.t()}
@@ -103,6 +104,15 @@ defmodule WebSockex.Conn do
     a `t:connect_attempt/0` map. It runs in the connecting process; anything it
     raises, throws or exits with is ignored. The time it takes counts against
     `:socket_connect_timeout`, so keep it fast.
+  - `:socket_opener` - a 1-arity function that opens the socket instead of
+    `open_socket/1`'s own connect, for example through a proxy. It gets the
+    conn and returns `{:ok, socket}` or `{:error, reason}`. The socket must
+    match `:conn_mod`: a `:gen_tcp` socket for `ws://`, an `:ssl` socket with
+    the handshake done for `wss://`. It runs in the connecting process, owns
+    the timeouts and the TLS options, and must leave the socket passive
+    (`active: false`). It takes precedence over `:tcp_attempt_timeout`:
+    when both are set, `:tcp_attempt_timeout`, `:tcp_max_attempts`,
+    `:on_connect_attempt` and `:resolver` are ignored. _Defaults to `nil`_.
 
   [public_key]: http://erlang.org/doc/apps/public_key/using_public_key.html
   """
@@ -117,6 +127,7 @@ defmodule WebSockex.Conn do
           | {:tcp_attempt_timeout, pos_integer | nil}
           | {:tcp_max_attempts, pos_integer}
           | {:on_connect_attempt, (connect_attempt -> any) | nil}
+          | {:socket_opener, (t -> {:ok, socket} | {:error, term}) | nil}
 
   @typedoc """
   The event passed to the `:on_connect_attempt` function.
@@ -182,7 +193,8 @@ defmodule WebSockex.Conn do
       tcp_max_attempts: Keyword.get(opts, :tcp_max_attempts) || @tcp_max_attempts_default,
       on_connect_attempt: Keyword.get(opts, :on_connect_attempt, nil),
       # Test seam: `(charlist -> {:ok, [:inet.ip_address()]} | {:error, term})`.
-      resolver: Keyword.get(opts, :resolver, nil)
+      resolver: Keyword.get(opts, :resolver, nil),
+      socket_opener: Keyword.get(opts, :socket_opener, nil)
     }
   end
 
@@ -255,6 +267,13 @@ defmodule WebSockex.Conn do
   """
   @spec open_socket(__MODULE__.t()) :: {:ok, __MODULE__.t()} | {:error, term}
   def open_socket(conn)
+
+  def open_socket(%{socket_opener: opener} = conn) when is_function(opener, 1) do
+    case opener.(conn) do
+      {:ok, socket} -> {:ok, Map.put(conn, :socket, socket)}
+      {:error, error} -> {:error, %WebSockex.ConnError{original: error}}
+    end
+  end
 
   def open_socket(%{tcp_attempt_timeout: timeout} = conn) when is_integer(timeout) do
     deadline = deadline(conn.socket_connect_timeout)

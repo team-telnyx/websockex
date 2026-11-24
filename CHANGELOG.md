@@ -10,6 +10,9 @@
 ### Enhancements
 - Added the `:tcp_attempt_timeout`, `:tcp_max_attempts` and
   `:on_connect_attempt` connection options. See `WebSockex.Conn`.
+- Added the `:socket_opener` connection option: a function that opens the
+  socket instead of the built-in connect (for example through a proxy). It
+  takes precedence over `:tcp_attempt_timeout`. See `WebSockex.Conn`.
   - With `:tcp_attempt_timeout` set, a lost TCP SYN is answered with a new
     socket instead of waiting for retransmits on the same one. Up to
     `:tcp_max_attempts` (default 3) TCP attempts rotate through the resolved
